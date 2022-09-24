@@ -22,7 +22,7 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 
-	"github.com/cert-manager/csi-lib/metadata"
+	"github.com/guilhem/csi-runtime/metadata"
 )
 
 type MemoryFS struct {
