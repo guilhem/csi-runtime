@@ -17,8 +17,6 @@ limitations under the License.
 package metadata
 
 import (
-	"time"
-
 	"github.com/container-storage-interface/spec/lib/go/csi"
 )
 
@@ -31,9 +29,6 @@ type Metadata struct {
 	// TargetPath is the path bind mounted into the target container (e.g. in
 	// Kubernetes, this is within the kubelet's 'pods' directory).
 	TargetPath string `json:"targetPath"`
-
-	// NextIssuanceTime is the time after which a re-issuance should begin.
-	NextIssuanceTime *time.Time `json:"nextIssuanceTime,omitempty"`
 
 	// System-specific attributes extracted from the NodePublishVolume request.
 	// These are sourced from the VolumeContext.

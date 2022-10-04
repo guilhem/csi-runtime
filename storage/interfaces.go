@@ -19,7 +19,7 @@ package storage
 import (
 	"fmt"
 
-	"github.com/cert-manager/csi-lib/metadata"
+	"github.com/guilhem/csi-runtime/metadata"
 )
 
 var (

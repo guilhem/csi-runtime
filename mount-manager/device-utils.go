@@ -1,0 +1,325 @@
+/*
+Copyright 2018 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package mountmanager
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+	pathutils "k8s.io/utils/path"
+)
+
+const (
+	diskByIdPath         = "/dev/disk/by-id/"
+	diskGooglePrefix     = "google-"
+	diskScsiGooglePrefix = "scsi-0Google_PersistentDisk_"
+	diskPartitionSuffix  = "-part"
+	diskSDPath           = "/dev/sd"
+	diskSDPattern        = "/dev/sd*"
+	diskNvmePath         = "/dev/nvme"
+	diskNvmePattern      = "/dev/nvme*"
+	// How many times to retry for a consistent read of /proc/mounts.
+	maxListTries = 3
+	// Number of fields per line in /proc/mounts as per the fstab man page.
+	expectedNumFieldsPerLine = 6
+	// Location of the mount file to use
+	procMountsPath = "/proc/mounts"
+	// Location of the mountinfo file
+	procMountInfoPath = "/proc/self/mountinfo"
+	// 'fsck' found errors and corrected them
+	fsckErrorsCorrected = 1
+	// 'fsck' found errors but exited without correcting them
+	fsckErrorsUncorrected = 4
+	defaultMountCommand   = "mount"
+	// scsi_id output should be in the form of:
+	// 0Google PersistentDisk <disk name>
+	scsiPattern = `^0Google\s+PersistentDisk\s+([\S]+)\s*$`
+	// google_nvme_id output should be in the form of:
+	// ID_SERIAL_SHORT=<disk name>
+	// Note: The google_nvme_id tool prints out multiple lines, hence we don't
+	// use '^' and '$' to wrap nvmePattern as is done in scsiPattern.
+	nvmePattern = `ID_SERIAL_SHORT=([\S]+)\s*`
+	scsiIdPath  = "/lib/udev_containerized/scsi_id"
+	nvmeIdPath  = "/lib/udev_containerized/google_nvme_id"
+)
+
+var (
+	// regex to parse scsi_id output and extract the serial
+	scsiRegex = regexp.MustCompile(scsiPattern)
+	// regex to parse google_nvme_id output and extract the serial
+	nvmeRegex = regexp.MustCompile(nvmePattern)
+)
+
+// DeviceUtils are a collection of methods that act on the devices attached
+// to a GCE Instance
+type DeviceUtils interface {
+	// VerifyDevicePath returns the first of the list of device paths that
+	// exists on the machine, or an empty string if none exists
+	VerifyDevicePath(devicePath string, deviceName string) (bool, error)
+}
+
+type deviceUtils struct {
+}
+
+var _ DeviceUtils = &deviceUtils{}
+
+func NewDeviceUtils() *deviceUtils {
+	return &deviceUtils{}
+}
+
+// getScsiSerial assumes that scsiIdPath exists and will error if it
+// doesnt. It is the callers responsibility to verify the existence of this
+// tool. Calls scsi_id on the given devicePath to get the serial number reported
+// by that device.
+func getScsiSerial(devicePath string) (string, error) {
+	out, err := exec.Command(
+		scsiIdPath,
+		"--page=0x83",
+		"--whitelisted",
+		fmt.Sprintf("--device=%v", devicePath)).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("scsi_id failed for device %q with output %s: %v", devicePath, string(out), err)
+	}
+
+	return parseScsiSerial(string(out))
+}
+
+// Parse the output returned by scsi_id and extract the serial number
+func parseScsiSerial(output string) (string, error) {
+	substrings := scsiRegex.FindStringSubmatch(output)
+	if substrings == nil {
+		return "", fmt.Errorf("scsi_id output cannot be parsed: %q", output)
+	}
+
+	return substrings[1], nil
+}
+
+// getNvmeSerial calls google_nvme_id on the given devicePath to get the serial
+// number reported by that device.
+// NOTE: getNvmeSerial assumes that nvmeIdPath exists and will error if it
+// doesn't. It is the caller's responsibility to verify the existence of this
+// tool.
+func getNvmeSerial(devicePath string) (string, error) {
+	out, err := exec.Command(
+		nvmeIdPath,
+		fmt.Sprintf("-d%s", devicePath)).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("google_nvme_id failed for device %q with output %v: %v", devicePath, out, err)
+	}
+
+	return parseNvmeSerial(string(out))
+}
+
+// Parse the output returned by google_nvme_id and extract the serial number
+func parseNvmeSerial(output string) (string, error) {
+	substrings := nvmeRegex.FindStringSubmatch(output)
+	if substrings == nil {
+		return "", fmt.Errorf("google_nvme_id output cannot be parsed: %q", output)
+	}
+
+	return substrings[1], nil
+}
+
+func ensureUdevToolExists(toolPath string) error {
+	exists, err := pathutils.Exists(pathutils.CheckFollowSymlink, toolPath)
+	if err != nil {
+		return fmt.Errorf("failed to check existence of %q: %v", toolPath, err)
+	}
+	if !exists {
+		// The driver should be containerized with the tool so maybe something is
+		// wrong with the build process
+		return fmt.Errorf("could not find tool at %q, unable to verify device paths", nvmeIdPath)
+	}
+	return nil
+}
+
+func ensureUdevToolsExist() error {
+	if err := ensureUdevToolExists(scsiIdPath); err != nil {
+		return err
+	}
+	if err := ensureUdevToolExists(nvmeIdPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+// VerifyDevicePath returns the first devicePath that maps to a real disk in the
+// candidate devicePaths or an empty string if none is found.
+// If the device is not found, it will attempt to fix any issues
+// caused by missing paths or mismatched devices by running a udevadm --trigger.
+func (m *deviceUtils) VerifyDevicePath(devicePath string, deviceName string) (bool, error) {
+	const (
+		pollInterval = 500 * time.Millisecond
+		pollTimeout  = 3 * time.Second
+	)
+
+	// Ensure tools in /lib/udev_containerized directory exist
+
+	if err := ensureUdevToolsExist(); err != nil {
+		return false, err
+	}
+
+	err := wait.Poll(pollInterval, pollTimeout, func() (bool, error) {
+
+		ok, err := pathExists(devicePath)
+		if err != nil {
+			return false, fmt.Errorf("failed to check for existing device path: %w", err)
+		}
+		if !ok {
+			return false, nil
+		}
+
+		if len(devicePath) == 0 {
+			// Couldn't find a /dev/disk/by-id path for this deviceName, so we need to
+			// find a /dev/* with a serial that matches deviceName. Then we attempt
+			// to repair the symlink.
+			err := udevadmTriggerForDiskIfExists(deviceName)
+			if err != nil {
+				return false, fmt.Errorf("failed to trigger udevadm fix of non existent disk for %q: %w", deviceName, err)
+			}
+			// Go to next retry loop to get the deviceName again after
+			// potentially fixing it with the udev command
+			return false, nil
+		}
+
+		// If there exists a devicePath we make sure disk at /dev/* matches the
+		// expected disk at devicePath by matching device Serial to the disk name
+		devFsPath, err := filepath.EvalSymlinks(devicePath)
+		if err != nil {
+			return false, fmt.Errorf("filepath.EvalSymlinks(%q) failed with %v", devicePath, err)
+		}
+
+		devFsSerial, err := getDevFsSerial(devFsPath)
+		if err != nil {
+			return false, fmt.Errorf("couldn't get serial number for disk %s at path %s: %w", deviceName, devFsPath, err)
+		}
+		// SUCCESS! devicePath points to a /dev/* path that has a serial
+		// equivalent to our disk name
+		if len(devFsSerial) != 0 && devFsSerial == deviceName {
+			return true, nil
+		}
+
+		// A /dev/* path exists, but is either not a recognized /dev prefix type
+		// (/dev/nvme* or /dev/sd*) or devicePath is not mapped to the correct disk.
+		// Attempt a repair
+
+		if err := udevadmTriggerForDiskIfExists(deviceName); err != nil {
+			return false, fmt.Errorf("failed to trigger udevadm fix of misconfigured disk for %q: %w", deviceName, err)
+		}
+		// Go to next retry loop to get the deviceName again after
+		// potentially fixing it with the udev command
+		return false, nil
+	})
+
+	if err != nil {
+		return false, fmt.Errorf("failed to find and re-link disk %s with udevadm after retrying for %v: %w", deviceName, pollTimeout, err)
+	}
+
+	return true, nil
+}
+
+// getDevFsSerial returns the serial number of the /dev/* path at devFsPath.
+// If devFsPath does not start with a known prefix, returns the empty string.
+func getDevFsSerial(devFsPath string) (string, error) {
+	switch {
+	case strings.HasPrefix(devFsPath, diskSDPath):
+		return getScsiSerial(devFsPath)
+	case strings.HasPrefix(devFsPath, diskNvmePath):
+		return getNvmeSerial(devFsPath)
+	default:
+		return "", nil
+	}
+}
+
+func findAvailableDevFsPaths() ([]string, error) {
+	diskSDPaths, err := filepath.Glob(diskSDPattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to filepath.Glob(\"%s\"): %v", diskSDPattern, err)
+	}
+	diskNvmePaths, err := filepath.Glob(diskNvmePattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to filepath.Glob(\"%s\"): %v", diskNvmePattern, err)
+	}
+	return append(diskSDPaths, diskNvmePaths...), nil
+}
+
+func udevadmTriggerForDiskIfExists(deviceName string) error {
+	devFsPathToSerial := map[string]string{}
+	devFsPaths, err := findAvailableDevFsPaths()
+	if err != nil {
+		return err
+	}
+	for _, devFsPath := range devFsPaths {
+		devFsSerial, err := getDevFsSerial(devFsPath)
+		if err != nil || len(devFsSerial) == 0 {
+			// If we get an error, ignore. Either this isn't a block device, or it
+			// isn't something we can get a serial number from
+			// klog.V(7).Infof("failed to get Serial num for disk %s at path %s: %v", deviceName, devFsPath, err)
+			continue
+		}
+		devFsPathToSerial[devFsPath] = devFsSerial
+		if devFsSerial == deviceName {
+			// Found the disk that we're looking for so run a trigger on it
+			// to resolve its /dev/by-id/ path
+			// klog.Warningf("udevadm --trigger running to fix disk at path %s which has serial numberID %s", devFsPath, devFsSerial)
+			err := udevadmChangeToDrive(devFsPath)
+			if err != nil {
+				return fmt.Errorf("failed to fix disk which has serial numberID %s: %v", devFsSerial, err)
+			}
+			return nil
+		}
+	}
+	// klog.Warningf("udevadm --trigger requested to fix disk %s but no such disk was found in %v", deviceName, devFsPathToSerial)
+	return fmt.Errorf("udevadm --trigger requested to fix disk %s but no such disk was found", deviceName)
+}
+
+// Calls "udevadm trigger --action=change" on the specified drive. drivePath
+// must be the block device path to trigger on, in the format "/dev/*", or a
+// symlink to it. This is workaround for Issue #7972
+// (https://github.com/kubernetes/kubernetes/issues/7972). Once the underlying
+// issue has been resolved, this may be removed.
+// udevadm takes a little bit to work its magic in the background so any callers
+// should not expect the trigger to complete instantly and may need to poll for
+// the change
+func udevadmChangeToDrive(devFsPath string) error {
+	// Call "udevadm trigger --action=change --property-match=DEVNAME=/dev/..."
+	out, err := exec.Command(
+		"udevadm",
+		"trigger",
+		"--action=change",
+		fmt.Sprintf("--property-match=DEVNAME=%s", devFsPath)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("udevadmChangeToDrive: udevadm trigger failed for drive %q with output %s: %v.", devFsPath, string(out), err)
+	}
+	return nil
+}
+
+// PathExists returns true if the specified path exists.
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	} else if os.IsNotExist(err) {
+		return false, nil
+	} else {
+		return false, err
+	}
+}

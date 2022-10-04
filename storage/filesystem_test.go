@@ -22,7 +22,7 @@ import (
 	"testing"
 	"testing/fstest"
 
-	"github.com/cert-manager/csi-lib/metadata"
+	"github.com/guilhem/csi-runtime/metadata"
 )
 
 func TestFilesystem_ReadFile(t *testing.T) {

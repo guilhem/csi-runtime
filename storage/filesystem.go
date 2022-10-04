@@ -30,8 +30,8 @@ import (
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/mount-utils"
 
-	"github.com/cert-manager/csi-lib/metadata"
-	"github.com/cert-manager/csi-lib/third_party/util"
+	"github.com/guilhem/csi-runtime/metadata"
+	"github.com/guilhem/csi-runtime/third_party/util"
 )
 
 const (

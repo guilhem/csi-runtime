@@ -1,5 +1,6 @@
 /*
 Copyright 2021 The cert-manager Authors.
+Copyright 2022 Guilhem Lettron <guilhem@barpilot.io>.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +21,12 @@ import (
 	"net"
 
 	"github.com/go-logr/logr"
-	"k8s.io/mount-utils"
 
-	"github.com/cert-manager/csi-lib/manager"
-	"github.com/cert-manager/csi-lib/storage"
+	"github.com/guilhem/csi-runtime/controller"
+	"github.com/guilhem/csi-runtime/identity"
+	"github.com/guilhem/csi-runtime/node"
+	"github.com/guilhem/csi-runtime/server"
+	"github.com/guilhem/csi-runtime/utils"
 )
 
 // A Driver is a gRPC server that implements the CSI spec.
@@ -31,67 +34,35 @@ import (
 // automatically creates cert-manager CertificateRequests to obtain signed
 // certificate data.
 type Driver struct {
-	server *GRPCServer
+	server *server.Server
 }
 
-type Options struct {
-	// DriverName should match the driver name as configured in the Kubernetes
-	// CSIDriver object (e.g. 'csi.cert-manager.io')
-	DriverName string
-	// DriverVersion is the version of the driver to be returned during
-	// IdentityServer calls
-	DriverVersion string
-	// NodeID is the name/ID of the node this driver is running on (typically
-	// the Kubernetes node name)
-	NodeID string
-	// Store is a reference to a storage backend for writing files
-	Store storage.Interface
-	// Manager is used to fetch & renew certificate data
-	Manager *manager.Manager
-	// Mounter will be used to invoke operating system mount operations.
-	// If not specified, the current operating system's default implementation
-	// will be used (i.e. 'mount.New("")')
-	Mounter mount.Interface
-	// ContinueOnNotReady will cause the driver's nodeserver to continue
-	// mounting the volume even if the driver is not ready to create a request yet.
-	// This is useful if you need to defer requesting a certificate until after
-	// initialization of the Pod (e.g. IPAM so a pod IP is allocated).
-	// Enabling this option WILL cause a period of time during pod startup whereby
-	// certificate data is not available in the volume whilst the process is running.
-	// An `initContainer` or other special logic in the user application must be
-	// added to avoid running into CrashLoopBackOff situations which can delay pod
-	// start time.
-	ContinueOnNotReady bool
-}
+func New(endpoint, name, version string, idm identity.Interface, cs *controller.Server, ns *node.Server, log logr.Logger) (*Driver, error) {
 
-func New(endpoint string, log logr.Logger, opts Options) (*Driver, error) {
-	ids, cs, ns := buildServers(opts, log)
-	server, err := NewGRPCServer(endpoint, log, ids, cs, ns)
+	lis, err := utils.ListenerFromUrl(endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return &Driver{server: server}, nil
+	return NewWithListener(lis, name, version, idm, cs, ns, log)
 }
 
 // NewWithListener will construct a new CSI driver using the given net.Listener.
 // This is useful when more control over the listening parameters is required.
-func NewWithListener(lis net.Listener, log logr.Logger, opts Options) *Driver {
-	ids, cs, ns := buildServers(opts, log)
-	return &Driver{server: NewGRPCServerWithListener(lis, log, ids, cs, ns)}
-}
+func NewWithListener(lis net.Listener, name, version string, idm identity.Interface, cm controller.Interface, ns *node.Server, log logr.Logger) (*Driver, error) {
 
-func buildServers(opts Options, log logr.Logger) (*identityServer, *controllerServer, *nodeServer) {
-	if opts.Mounter == nil {
-		opts.Mounter = mount.New("")
+	var cs *controller.Server
+
+	ids := identity.New(name, version, cm != nil, idm)
+
+	if cm != nil {
+		cs = controller.New(cm)
 	}
-	return NewIdentityServer(opts.DriverName, opts.DriverVersion), &controllerServer{}, &nodeServer{
-		log:                log,
-		nodeID:             opts.NodeID,
-		manager:            opts.Manager,
-		store:              opts.Store,
-		mounter:            opts.Mounter,
-		continueOnNotReady: opts.ContinueOnNotReady,
-	}
+
+	// storage.NewFilesystem(log, baseDir string)
+
+	serv := server.New(lis, log, ids, cs, ns)
+
+	return &Driver{server: serv}, nil
 }
 
 func (d *Driver) Run() error {
